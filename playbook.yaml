@@ -1,0 +1,566 @@
+---
+- name: Configurar servidor del visualizador
+  hosts: staging
+  become: true
+  gather_facts: true
+
+  vars:
+    # -------------------------------------------------------------------------
+    # Configuración general
+    # -------------------------------------------------------------------------
+    nombre_aplicacion: visualizador
+    nombre_sistema: visualizador
+    dominio: 192.168.62.47
+
+    # Puerto publicado por el contenedor Nginx de la aplicación.
+    puerto_aplicacion: >-
+      {{ lookup('ansible.builtin.env', 'DOCKER_NETWORK_GATEWAY') | default('8088', true) }}
+
+
+    # Puerto SSH real del servidor.
+    puerto_ssh: 22
+
+    # -------------------------------------------------------------------------
+    # Docker
+    # -------------------------------------------------------------------------
+    docker_subnet: >-
+      {{ lookup('ansible.builtin.env', 'DOCKER_NETWORK_SUBNET') | default('172.23.0.0/16', true) }}
+    docker_gateway: >-
+      {{ lookup('ansible.builtin.env', 'DOCKER_NETWORK_GATEWAY') | default('172.23.0.1', true) }}
+
+    # -------------------------------------------------------------------------
+    # PostgreSQL
+    # -------------------------------------------------------------------------
+    postgres_version: "12"
+    postgres_cluster: main
+    postgres_port: >-
+      {{ lookup('ansible.builtin.env', 'POSTGRES_CONNECTION_PORT') | default('5432', true) }}
+    postgres_connection_host: >-
+      {{ lookup('ansible.builtin.env', 'POSTGRES_CONNECTION_HOST') | default('/var/run/postgresql', true) }}
+    postgres_connection_user: >-
+      {{ lookup('ansible.builtin.env', 'POSTGRES_CONNECTION_USER') | default('postgres', true) }}
+    postgres_connection_password: >-
+      {{ lookup('ansible.builtin.env', 'POSTGRES_CONNECTION_PASSWORD') }}
+
+    postgres_config_dir: >-
+      /etc/postgresql/{{ postgres_version }}/{{ postgres_cluster }}
+
+    # postgres_config_file: >-
+    #   {{ postgres_config_dir }}/postgresql.conf
+
+    postgres_hba_file: >-
+      {{ postgres_config_dir }}/pg_hba.conf
+
+    # -------------------------------------------------------------------------
+    # MariaDB
+    # -------------------------------------------------------------------------
+    # Credenciales usadas solamente para inspeccionar los usuarios y grants.
+    # La contrasena se toma del entorno del controlador y no se guarda aqui.
+    mariadb_connection_host: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_CONNECTION_HOST') | default('127.0.0.1', true) }}
+    mariadb_connection_port: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_CONNECTION_PORT') | default('3306', true) }}
+    mariadb_connection_protocol: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_CONNECTION_PROTOCOL') | default('SOCKET', true) }}
+    mariadb_connection_socket: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_CONNECTION_SOCKET') | default('/run/mysqld/mysqld.sock', true) }}
+    mariadb_connection_user: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_CONNECTION_USER') | default('root', true) }}
+    mariadb_connection_password: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_LOGIN_PASSWORD') }}
+    mariadb_client_binary: mariadb
+
+    # Cuenta y alcance que el playbook debe crear si falta y luego verificar.
+    mariadb_admin_user: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_ADMIN_USER') | default('admin', true) }}
+    mariadb_admin_host: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_ADMIN_HOST') | default('%', true) }}
+    mariadb_admin_password: >-
+      {{ lookup('ansible.builtin.env', 'MARIADB_ADMIN_PASSWORD') }}
+
+    # -------------------------------------------------------------------------
+    # Apache
+    # -------------------------------------------------------------------------
+    apache_site_name: visualizador.conf
+
+    apache_site_available: >-
+      /etc/apache2/sites-available/{{ apache_site_name }}
+
+    apache_site_enabled: >-
+      /etc/apache2/sites-enabled/{{ apache_site_name }}
+
+    # -------------------------------------------------------------------------
+    # Backups
+    # -------------------------------------------------------------------------
+    backup_remote_root: /var/backups/ansible
+
+    # ansible_date_time se obtiene con gather_facts.
+    backup_timestamp: >-
+      {{ ansible_date_time.iso8601_basic_short }}
+
+    backup_remote_dir: >-
+      {{ backup_remote_root }}/{{ backup_timestamp }}
+
+    backup_archive: >-
+      {{ backup_remote_root }}/config-{{ inventory_hostname }}-{{ backup_timestamp }}.tar.gz
+
+    # Esta ruta pertenece al contenedor controlador.
+    # Al estar /ansible montado, termina en tu PC.
+    backup_local_dir: /ansible/backups
+
+  pre_tasks:
+    # =========================================================================
+    # Validaciones iniciales
+    # =========================================================================
+
+    - name: Verificar que el sistema sea Debian o Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+        fail_msg: >-
+          Este playbook está preparado para Debian/Ubuntu.
+          El host detectado pertenece a {{ ansible_facts.os_family }}.
+        success_msg: Sistema Debian/Ubuntu detectado
+
+    - name: Verificar existencia de pg_hba.conf
+      ansible.builtin.stat:
+        path: "{{ postgres_hba_file }}"
+      register: postgres_hba_stat
+
+    - name: Detener ejecución si no existe pg_hba.conf
+      ansible.builtin.assert:
+        that:
+          - postgres_hba_stat.stat.exists
+        fail_msg: >-
+          No se encontró {{ postgres_hba_file }}.
+          Revisá postgres_version y postgres_cluster.
+
+    # =========================================================================
+    # Backup previo
+    # =========================================================================
+
+    - name: Crear directorio principal de backups remotos
+      ansible.builtin.file:
+        path: "{{ backup_remote_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Crear directorio para el backup actual
+      ansible.builtin.file:
+        path: "{{ backup_remote_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Copiar configuración de Apache al backup
+      ansible.builtin.copy:
+        src: /etc/apache2/
+        dest: "{{ backup_remote_dir }}/apache2/"
+        remote_src: true
+        owner: root
+        group: root
+        mode: preserve
+
+    - name: Copiar configuración de PostgreSQL al backup
+      ansible.builtin.copy:
+        src: "{{ postgres_config_dir }}/"
+        dest: "{{ backup_remote_dir }}/postgresql/"
+        remote_src: true
+        owner: root
+        group: root
+        mode: preserve
+
+    - name: Copiar configuración de UFW al backup
+      ansible.builtin.copy:
+        src: /etc/ufw/
+        dest: "{{ backup_remote_dir }}/ufw/"
+        remote_src: true
+        owner: root
+        group: root
+        mode: preserve
+
+    - name: Guardar estado legible de UFW
+      ansible.builtin.command:
+        cmd: ufw status numbered
+      register: ufw_status_before
+      changed_when: false
+      failed_when: false
+
+    - name: Escribir estado de UFW en el backup
+      ansible.builtin.copy:
+        content: |
+          Fecha: {{ ansible_date_time.iso8601 }}
+          Host: {{ inventory_hostname }}
+
+          {{ ufw_status_before.stdout | default("No fue posible consultar UFW") }}
+        dest: "{{ backup_remote_dir }}/ufw-status.txt"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Crear archivo comprimido del backup
+      community.general.archive:
+        path: "{{ backup_remote_dir }}"
+        dest: "{{ backup_archive }}"
+        format: gz
+        owner: root
+        group: root
+        mode: "0600"
+        force_archive: true
+
+    - name: Crear carpeta local de backups
+      ansible.builtin.file:
+        path: "{{ backup_local_dir }}"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      become: false
+
+    - name: Descargar backup a la máquina controladora
+      ansible.builtin.fetch:
+        src: "{{ backup_archive }}"
+        dest: "{{ backup_local_dir }}/"
+        flat: true
+
+  tasks:
+    # =========================================================================
+    # Apache
+    # =========================================================================
+
+    - name: Habilitar módulos requeridos de Apache
+      community.general.apache2_module:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - proxy
+        - proxy_http
+        - headers
+        - rewrite
+      notify: Validar y recargar Apache
+
+    - name: Instalar VirtualHost del visualizador
+      ansible.builtin.template:
+        src: templates/visualizador.conf.j2
+        dest: "{{ apache_site_available }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      notify: Validar y recargar Apache
+
+    - name: Habilitar sitio del visualizador
+      ansible.builtin.file:
+        src: "{{ apache_site_available }}"
+        dest: "{{ apache_site_enabled }}"
+        state: link
+        force: true
+      notify: Validar y recargar Apache
+
+    - name: Asegurar que Apache esté habilitado y activo
+      ansible.builtin.service:
+        name: apache2
+        state: started
+        enabled: true
+
+    # =========================================================================
+    # UFW
+    # =========================================================================
+
+    # Esta regla debe aplicarse antes de habilitar el firewall.
+    - name: Permitir SSH antes de habilitar UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ puerto_ssh | string }}"
+        proto: tcp
+        comment: Acceso SSH administrado por Ansible
+
+    - name: Permitir HTTP
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+        comment: Tráfico HTTP
+
+    - name: Permitir HTTPS
+      community.general.ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+        comment: Tráfico HTTPS
+
+    - name: Permitir PostgreSQL únicamente desde la red Docker
+      community.general.ufw:
+        rule: allow
+        port: "{{ postgres_port | string }}"
+        proto: tcp
+        from_ip: "{{ docker_subnet }}"
+        comment: PostgreSQL desde contenedores Docker
+
+    - name: Autorizar conexiones desde la red Docker en pg_hba.conf
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ postgres_hba_file }}"
+        contype: host
+        databases: all
+        users: all
+        source: "{{ docker_subnet }}"
+        method: md5
+        state: present
+        backup: true
+      notify: Recargar PostgreSQL
+
+    # =========================================================================
+    # Aplicar handlers antes de validar
+    # =========================================================================
+
+    - name: Aplicar cambios pendientes de configuración
+      ansible.builtin.meta: flush_handlers
+
+    # =========================================================================
+    # Verificaciones finales
+    # =========================================================================
+
+    - name: Comprobar sintaxis efectiva de Apache
+      ansible.builtin.command:
+        cmd: apache2ctl configtest
+      register: apache_configtest
+      changed_when: false
+
+    - name: Verificar que Apache responda localmente
+      ansible.builtin.uri:
+        url: http://127.0.0.1/
+        method: GET
+        status_code:
+          - 200
+          - 301
+          - 302
+          - 403
+          - 404
+        return_content: false
+      register: apache_http_check
+      retries: 3
+      delay: 2
+      until: apache_http_check.status is defined
+
+    - name: Consultar direcciones de escucha de PostgreSQL
+      become_user: postgres
+      ansible.builtin.command:
+        argv:
+          - psql
+          - "--host={{ postgres_connection_host }}"
+          - "--port={{ postgres_port }}"
+          - "--username={{ postgres_connection_user }}"
+          - "--tuples-only"
+          - "--no-align"
+          - "--command=SHOW listen_addresses;"
+      environment:
+        PGPASSWORD: "{{ postgres_connection_password }}"
+      register: postgres_listen_addresses
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Verificar conexión de inspección a PostgreSQL
+      ansible.builtin.assert:
+        that:
+          - postgres_listen_addresses.rc == 0
+        fail_msg: >-
+          No fue posible consultar PostgreSQL mediante
+          {{ postgres_connection_host }}:{{ postgres_port }} como
+          {{ postgres_connection_user }}. Revisá POSTGRES_CONNECTION_PASSWORD
+          y las demás variables POSTGRES_CONNECTION_* del archivo .env.
+
+    - name: Consultar puerto efectivo de PostgreSQL
+      become_user: postgres
+      ansible.builtin.command:
+        argv:
+          - psql
+          - "--host={{ postgres_connection_host }}"
+          - "--port={{ postgres_port }}"
+          - "--username={{ postgres_connection_user }}"
+          - "--tuples-only"
+          - "--no-align"
+          - "--command=SHOW port;"
+      environment:
+        PGPASSWORD: "{{ postgres_connection_password }}"
+      register: postgres_effective_port
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Verificar consulta del puerto de PostgreSQL
+      ansible.builtin.assert:
+        that:
+          - postgres_effective_port.rc == 0
+        fail_msg: >-
+          La conexión a PostgreSQL se estableció, pero no fue posible consultar
+          el puerto efectivo.
+
+    - name: Consultar existencia de la cuenta admin de MariaDB
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              mariadb_client_binary,
+              '--protocol=' ~ mariadb_connection_protocol
+            ]
+            + (
+              ['--socket=' ~ mariadb_connection_socket]
+              if mariadb_connection_protocol | upper == 'SOCKET'
+              else [
+                '--host=' ~ mariadb_connection_host,
+                '--port=' ~ mariadb_connection_port
+              ]
+            )
+            + [
+              '--user=' ~ mariadb_connection_user,
+              '--batch',
+              '--skip-column-names',
+              '--execute',
+              "SELECT COUNT(*) FROM mysql.user WHERE User = '"
+              ~ (mariadb_admin_user | replace("'", "''"))
+              ~ "' AND Host = '"
+              ~ (mariadb_admin_host | replace("'", "''"))
+              ~ "';"
+            ]
+          }}
+      environment:
+        MYSQL_PWD: "{{ mariadb_connection_password }}"
+      register: mariadb_admin_exists
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Verificar conexion de inspeccion a MariaDB
+      ansible.builtin.assert:
+        that:
+          - mariadb_admin_exists.rc == 0
+        fail_msg: >-
+          No fue posible consultar MariaDB mediante
+          {{ mariadb_connection_protocol }} como {{ mariadb_connection_user }}.
+          Revisa las variables MARIADB_CONNECTION_* y
+          MARIADB_LOGIN_PASSWORD.
+
+    - name: Verificar password para crear la cuenta admin de MariaDB
+      ansible.builtin.assert:
+        that:
+          - mariadb_admin_password | length > 0
+        fail_msg: >-
+          La cuenta '{{ mariadb_admin_user }}'@'{{ mariadb_admin_host }}' no
+          existe. Define MARIADB_ADMIN_PASSWORD en el archivo .env para poder
+          crearla de forma segura.
+      when: mariadb_admin_exists.stdout | trim == "0"
+
+    - name: Crear la cuenta admin de MariaDB si no existe
+      community.mysql.mysql_user:
+        login_host: >-
+          {{ mariadb_connection_host if mariadb_connection_protocol | upper == 'TCP' else omit }}
+        login_port: >-
+          {{ mariadb_connection_port | int if mariadb_connection_protocol | upper == 'TCP' else omit }}
+        login_unix_socket: >-
+          {{ mariadb_connection_socket if mariadb_connection_protocol | upper == 'SOCKET' else omit }}
+        login_user: "{{ mariadb_connection_user }}"
+        login_password: "{{ mariadb_connection_password }}"
+        config_file: ""
+        name: "{{ mariadb_admin_user }}"
+        host: "{{ mariadb_admin_host }}"
+        password: "{{ mariadb_admin_password }}"
+        priv: "*.*:ALL"
+        state: present
+        update_password: on_create
+      when: mariadb_admin_exists.stdout | trim == "0"
+      no_log: true
+
+    - name: Consultar privilegios globales de la cuenta admin de MariaDB
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              mariadb_client_binary,
+              '--protocol=' ~ mariadb_connection_protocol
+            ]
+            + (
+              ['--socket=' ~ mariadb_connection_socket]
+              if mariadb_connection_protocol | upper == 'SOCKET'
+              else [
+                '--host=' ~ mariadb_connection_host,
+                '--port=' ~ mariadb_connection_port
+              ]
+            )
+            + [
+              '--user=' ~ mariadb_connection_user,
+              '--batch',
+              '--skip-column-names',
+              '--execute',
+              "SHOW GRANTS FOR '"
+              ~ (mariadb_admin_user | replace("'", "''"))
+              ~ "'@'"
+              ~ (mariadb_admin_host | replace("'", "''"))
+              ~ "';"
+            ]
+          }}
+      environment:
+        MYSQL_PWD: "{{ mariadb_connection_password }}"
+      register: mariadb_admin_grants
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Verificar acceso de admin a todas las bases de MariaDB
+      ansible.builtin.assert:
+        that:
+          - mariadb_admin_grants.rc == 0
+          - >-
+            mariadb_admin_grants.stdout is
+            regex('(?im)^GRANT ALL PRIVILEGES ON \\*\\.\\* TO ')
+        fail_msg: >-
+          La cuenta '{{ mariadb_admin_user }}'@'{{ mariadb_admin_host }}' no
+          tiene ALL PRIVILEGES ON *.* o no fue posible consultar sus grants.
+        success_msg: >-
+          La cuenta '{{ mariadb_admin_user }}'@'{{ mariadb_admin_host }}' tiene
+          acceso total a todas las bases de MariaDB.
+
+    - name: Consultar estado final de UFW
+      ansible.builtin.command:
+        cmd: ufw status numbered
+      register: ufw_status_after
+      changed_when: false
+
+    - name: Mostrar resumen final
+      ansible.builtin.debug:
+        msg:
+          - "Backup remoto: {{ backup_archive }}"
+          - "Backup descargado en: {{ backup_local_dir }}"
+          - "Apache: {{ apache_configtest.stdout }}"
+          - "PostgreSQL listen_addresses: {{ postgres_listen_addresses.stdout | trim }}"
+          - "PostgreSQL port: {{ postgres_effective_port.stdout | trim }}"
+          - "Docker network: {{ docker_subnet }} (gateway {{ docker_gateway }})"
+          - >-
+            MariaDB: '{{ mariadb_admin_user }}'@'{{ mariadb_admin_host }}'
+            existe y tiene ALL PRIVILEGES ON *.*
+          - "{{ ufw_status_after.stdout }}"
+
+  handlers:
+    - name: Validar configuración de Apache antes de recargar
+      ansible.builtin.command:
+        cmd: apache2ctl configtest
+      changed_when: false
+      listen: Validar y recargar Apache
+
+    - name: Recargar Apache después de validar
+      ansible.builtin.service:
+        name: apache2
+        state: reloaded
+      listen: Validar y recargar Apache
+
+    - name: Recargar PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: reloaded
+
+    - name: Reiniciar PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: restarted

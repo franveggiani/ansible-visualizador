@@ -1,0 +1,19 @@
+# Configuracion administrada por Ansible para el visualizador.
+<VirtualHost *:80>
+    ServerName {{ dominio }}
+
+    ProxyRequests Off
+    ProxyPreserveHost On
+
+    RequestHeader set X-Forwarded-Proto "http"
+    RequestHeader set X-Forwarded-Port "80"
+
+    RedirectMatch 302 ^/$ /{{ nombre_sistema }}/
+    RedirectMatch 301 ^/{{ nombre_sistema }}$ /{{ nombre_sistema }}/
+
+    ProxyPass /{{ nombre_sistema }}/ http://127.0.0.1:{{ puerto_aplicacion }}/
+    ProxyPassReverse /{{ nombre_sistema }}/ http://127.0.0.1:{{ puerto_aplicacion }}/
+
+    ErrorLog ${APACHE_LOG_DIR}/{{ nombre_aplicacion }}_error.log
+    CustomLog ${APACHE_LOG_DIR}/{{ nombre_aplicacion }}_access.log combined
+</VirtualHost>

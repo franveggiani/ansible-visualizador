@@ -1,0 +1,5 @@
+# Credenciales locales
+.env
+
+# Backups generados por el playbook
+backups/

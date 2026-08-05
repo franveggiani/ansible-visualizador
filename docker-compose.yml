@@ -1,0 +1,58 @@
+services:
+  ansible:
+    build: .
+    image: ansible-controller:local
+    container_name: ansible-controller
+    working_dir: /ansible
+
+    volumes:
+      # Playbooks, inventarios y templates
+      - ./:/ansible
+
+      # Se monta aparte para poder aplicar permisos Linux dentro del contenedor.
+      - ${USERPROFILE}/.ssh:/ssh-host:ro
+
+    environment:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+      ANSIBLE_CONFIG: /ansible/ansible.cfg
+      DOCKER_NETWORK_SUBNET: "${DOCKER_NETWORK_SUBNET:-172.23.0.0/16}"
+      DOCKER_NETWORK_GATEWAY: "${DOCKER_NETWORK_GATEWAY:-172.23.0.1}"
+      POSTGRES_CONNECTION_HOST: "${POSTGRES_CONNECTION_HOST:-/var/run/postgresql}"
+      POSTGRES_CONNECTION_PORT: "${POSTGRES_CONNECTION_PORT:-5432}"
+      POSTGRES_CONNECTION_USER: "${POSTGRES_CONNECTION_USER:-postgres}"
+      POSTGRES_CONNECTION_PASSWORD: "${POSTGRES_CONNECTION_PASSWORD:-}"
+      MARIADB_CONNECTION_HOST: "${MARIADB_CONNECTION_HOST:-127.0.0.1}"
+      MARIADB_CONNECTION_PORT: "${MARIADB_CONNECTION_PORT:-3306}"
+      MARIADB_CONNECTION_PROTOCOL: "${MARIADB_CONNECTION_PROTOCOL:-SOCKET}"
+      MARIADB_CONNECTION_SOCKET: "${MARIADB_CONNECTION_SOCKET:-/run/mysqld/mysqld.sock}"
+      MARIADB_CONNECTION_USER: "${MARIADB_CONNECTION_USER:-root}"
+      MARIADB_LOGIN_PASSWORD: "${MARIADB_LOGIN_PASSWORD:-}"
+      MARIADB_ADMIN_USER: "${MARIADB_ADMIN_USER:-admin}"
+      MARIADB_ADMIN_HOST: "${MARIADB_ADMIN_HOST:-%}"
+      MARIADB_ADMIN_PASSWORD: "${MARIADB_ADMIN_PASSWORD:-}"
+
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        rm -rf /root/.ssh &&
+        mkdir -p /root/.ssh &&
+        cp -R /ssh-host/. /root/.ssh/ &&
+        find /root/.ssh -type d -exec chmod 700 {} \; &&
+        find /root/.ssh -type f -exec chmod 600 {} \; &&
+        exec tail -f /dev/null
+
+    healthcheck:
+      test: ["CMD", "ansible", "--version"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+    restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: "${DOCKER_NETWORK_SUBNET:-172.23.0.0/16}"
+          gateway: "${DOCKER_NETWORK_GATEWAY:-172.23.0.1}"
