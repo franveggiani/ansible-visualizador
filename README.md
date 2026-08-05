@@ -1,308 +1,143 @@
-# Automatización del servidor del visualizador
+# Automatización de infraestructura con Ansible y Docker
 
-Este proyecto usa Ansible desde un contenedor Docker para preparar el servidor
-`staging` donde se publica el visualizador.
+Proyecto práctico basado en un caso real para automatizar la preparación de un servidor Linux utilizado como entorno de staging de una aplicación web.
 
-El playbook realiza backups de la configuración existente, prepara Apache como
-proxy inverso, agrega reglas de UFW y autoriza conexiones a PostgreSQL desde la
-red Docker. También verifica que MariaDB tenga una cuenta `'admin'@'%'` con
-`ALL PRIVILEGES ON *.*`; si la cuenta no existe, la crea. No crea bases de
-datos.
+El nodo controlador de Ansible se ejecuta dentro de Docker y administra el servidor remoto mediante SSH. El playbook realiza validaciones previas, genera backups de configuraciones críticas, configura Apache como reverse proxy, administra reglas de UFW, autoriza conexiones de PostgreSQL desde una red Docker y ejecuta verificaciones posteriores.
 
-## Arquitectura actual
+## Objetivos
+
+- Reducir cambios manuales sobre el servidor.
+- Mantener un entorno de control reproducible.
+- Generar backups antes de modificar configuraciones críticas.
+- Validar servicios y archivos antes y después de aplicar cambios.
+- Diseñar tareas idempotentes siempre que el proceso lo permita.
+
+## Arquitectura
 
 ```text
 PC controladora
 └── Contenedor ansible-controller
-    └── SSH → servidor staging (192.168.62.47)
+    └── SSH → servidor staging
                ├── Apache :80
-               │   └── proxy HTTP → 127.0.0.1:8088 (visualizador/Nginx)
-               └── PostgreSQL :5432
-                   └── acepta autenticación desde DOCKER_NETWORK_SUBNET
+               │   └── reverse proxy → 127.0.0.1:8088
+               ├── PostgreSQL :5432
+               ├── MariaDB :3306
+               └── UFW
 ```
 
-El contenedor definido en `docker-compose.yml` es solamente el controlador de
-Ansible. No es el contenedor de la aplicación y no despliega el visualizador.
-El playbook supone que el visualizador ya está publicado localmente en el
-servidor mediante el puerto `8088`.
+El contenedor definido en `docker-compose.yml` contiene solamente el controlador de Ansible. No despliega ni inicia la aplicación.
 
-## Archivos del proyecto
+## Funcionalidades
 
-| Archivo | Función |
-| --- | --- |
-| `Dockerfile` | Construye el controlador con Python 3.12, SSH y Ansible 12.x. |
-| `docker-compose.yml` | Ejecuta el controlador, monta el proyecto y copia las claves SSH. |
-| `.env` | Define localmente la red Docker y las conexiones a las bases de datos. |
-| `.gitignore` | Evita versionar `.env` y los backups generados. |
-| `ansible.cfg` | Define el inventario, opciones SSH y comportamiento general de Ansible. |
-| `inventory.ini` | Declara los hosts de `staging` y `production`. |
-| `playbook.yaml` | Contiene toda la configuración aplicada al servidor. |
-| `templates/visualizador.conf.j2` | Genera el VirtualHost HTTP del visualizador. |
-| `backups/` | Recibe en la PC los backups descargados desde el servidor. |
+### Validaciones previas
 
-## Hosts e inventario
+- Verifica que el servidor pertenezca a la familia Debian/Ubuntu.
+- Comprueba la existencia de `pg_hba.conf`.
+- Detiene la ejecución si faltan precondiciones obligatorias.
 
-El playbook tiene configurado:
+### Backups
 
-```yaml
-hosts: staging
-```
+Antes de aplicar cambios, el playbook respalda:
 
-Por lo tanto, actualmente solo actúa sobre `192.168.62.47`, usando el usuario
-`root` y `/usr/bin/python3.8` en el servidor remoto.
+- `/etc/apache2/`
+- La configuración del clúster PostgreSQL.
+- `/etc/ufw/`
+- El estado numerado de UFW.
 
-Aunque `inventory.ini` contiene un grupo `production`, este playbook no lo usa
-y no realiza cambios sobre ese host.
+Los archivos se comprimen en el servidor y luego se descargan al directorio local `backups/`.
 
-## Variables principales
+Cada ejecución genera un backup nuevo con marca de tiempo. Por ese motivo, esta parte es intencionalmente no idempotente.
 
-| Variable | Valor actual | Uso |
-| --- | --- | --- |
-| `nombre_aplicacion` | `visualizador` | Nombre utilizado, entre otras cosas, en los logs de Apache. |
-| `dominio` | `192.168.62.47` | `ServerName` del VirtualHost. |
-| `puerto_aplicacion` | `8088` | Puerto local donde Apache encuentra el visualizador. |
-| `puerto_ssh` | `22` | Puerto autorizado por UFW para administrar el servidor. |
-| `docker_subnet` | Entorno `DOCKER_NETWORK_SUBNET` | Red de Compose autorizada en UFW y `pg_hba.conf`. |
-| `docker_gateway` | Entorno `DOCKER_NETWORK_GATEWAY` | Gateway configurado en el IPAM de Compose. |
-| `postgres_version` | `12` | Versión usada para construir las rutas de configuración. |
-| `postgres_cluster` | `main` | Nombre del clúster PostgreSQL existente. |
-| `postgres_port` | Entorno `POSTGRES_CONNECTION_PORT`, por defecto `5432` | Puerto esperado y autorizado para PostgreSQL. |
-| `postgres_connection_host` | `/var/run/postgresql` | Socket o host usado para las consultas finales. |
-| `postgres_connection_user` | `postgres` | Usuario de las consultas finales. |
-| `postgres_connection_password` | Entorno `POSTGRES_CONNECTION_PASSWORD` | Contraseña para autenticarse en PostgreSQL. |
-| `mariadb_connection_host` | `127.0.0.1` | Host MariaDB usado para la verificación. |
-| `mariadb_connection_port` | `3306` | Puerto de conexión a MariaDB. |
-| `mariadb_connection_protocol` | `SOCKET` | Protocolo utilizado por el cliente MariaDB. Puede cambiarse a `TCP`. |
-| `mariadb_connection_socket` | `/run/mysqld/mysqld.sock` | Socket local utilizado cuando el protocolo es `SOCKET`. |
-| `mariadb_connection_user` | `root` | Usuario con permiso para consultar cuentas y grants. |
-| `mariadb_connection_password` | Entorno `MARIADB_LOGIN_PASSWORD` | Contraseña de la conexión de inspección. |
-| `mariadb_admin_user` | `admin` | Usuario MariaDB que se crea si no existe. |
-| `mariadb_admin_host` | `%` | Origen asociado a la cuenta administrada. |
-| `mariadb_admin_password` | Entorno `MARIADB_ADMIN_PASSWORD` | Contraseña aplicada solamente al crear la cuenta. |
-| `apache_site_name` | `visualizador.conf` | Nombre del archivo del sitio Apache. |
+### Apache HTTP Server
 
-## Flujo completo del playbook
+- Habilita `proxy`, `proxy_http`, `headers` y `rewrite`.
+- Genera el VirtualHost desde `templates/visualizador.conf.j2`.
+- Configura Apache como reverse proxy hacia la aplicación local.
+- Ejecuta `apache2ctl configtest` antes de recargar el servicio.
 
-### 1. Obtención de información del servidor
+### UFW
 
-Ansible ejecuta `gather_facts` antes de las tareas. Esto obtiene información del
-sistema operativo y la fecha del servidor, utilizada también para identificar
-los backups.
+Administra reglas para:
 
-### 2. Validaciones iniciales
+- SSH.
+- HTTP.
+- HTTPS.
+- PostgreSQL, restringido a la subred Docker configurada.
 
-Antes de modificar el servidor, el playbook comprueba que:
+El puerto interno de la aplicación no se expone porque Apache accede al backend mediante `127.0.0.1`.
 
-- El sistema pertenezca a la familia Debian, por ejemplo Debian o Ubuntu.
-- Exista `/etc/postgresql/12/main/postgresql.conf`.
-- Exista `/etc/postgresql/12/main/pg_hba.conf`.
+### PostgreSQL
 
-Si alguna condición no se cumple, la ejecución se detiene. PostgreSQL debe estar
-instalado previamente y sus rutas deben coincidir con `postgres_version` y
-`postgres_cluster`.
+- Agrega una regla en `pg_hba.conf` para permitir conexiones desde la red Docker.
+- Recarga PostgreSQL cuando cambia la configuración.
+- Verifica la conectividad y consulta los valores efectivos de puerto y `listen_addresses`.
 
-### 3. Backup previo
+La regla de acceso no crea bases de datos, usuarios ni contraseñas.
 
-Antes de aplicar cambios se crea un respaldo con una marca de tiempo.
+### MariaDB
 
-En el servidor remoto se guardan:
+El playbook verifica la existencia de una cuenta administrativa y puede crearla si no existe.
 
-- `/etc/apache2/`.
-- `/etc/postgresql/12/main/`.
-- `/etc/ufw/`.
-- La salida de `ufw status numbered` en un archivo legible.
+La configuración actual permite definir mediante variables el nombre de usuario, el host y la contraseña. El caso original utiliza privilegios globales porque responde a un requerimiento concreto del entorno interno.
 
-El contenido se reúne en:
+Para un entorno productivo nuevo se recomienda aplicar mínimo privilegio:
+
+- Restringir el host a una subred o dirección específica.
+- Otorgar permisos solamente sobre la base necesaria.
+- Evitar usuarios genéricos como `admin`.
+- Gestionar secretos con Ansible Vault o un gestor de secretos externo.
+
+## Estructura
 
 ```text
-/var/backups/ansible/<fecha-y-hora>/
+.
+├── .env.example
+├── .gitignore
+├── Dockerfile
+├── README.md
+├── ansible.cfg
+├── docker-compose.yml
+├── inventory.example.ini
+├── playbook.yaml
+└── templates/
+    └── visualizador.conf.j2
 ```
 
-Después se genera:
+Los archivos reales `.env`, `inventory.ini` y `backups/` están excluidos del repositorio.
 
-```text
-/var/backups/ansible/config-<host>-<fecha-y-hora>.tar.gz
+## Configuración
+
+### 1. Crear los archivos locales
+
+```bash
+cp .env.example .env
+cp inventory.example.ini inventory.ini
 ```
 
-Finalmente, Ansible descarga el archivo a `/ansible/backups` dentro del
-controlador. Como el proyecto está montado en `/ansible`, el archivo aparece en
-la carpeta local `backups/` de este repositorio.
+Editá ambos archivos con los datos del entorno que vas a administrar.
 
-Cada ejecución genera un backup nuevo.
+### 2. Variables principales
 
-### 4. Dependencias del servidor
-
-El playbook no administra APT ni instala paquetes. Espera que el servidor ya
-tenga disponibles `apache2`, `ufw`, `mariadb-client`, `python3-pymysql`,
-`python3-psycopg2` y PostgreSQL Server.
-
-### 5. Configuración de Apache
-
-Se habilitan los siguientes módulos:
-
-- `proxy`.
-- `proxy_http`.
-- `headers`.
-- `rewrite`.
-
-Luego se procesa `templates/visualizador.conf.j2` y se genera:
-
-```text
-/etc/apache2/sites-available/visualizador.conf
+```dotenv
+APP_DOMAIN=staging.example.internal
+APP_PORT=8088
+DOCKER_NETWORK_SUBNET=172.23.0.0/16
+DOCKER_NETWORK_GATEWAY=172.23.0.1
+POSTGRES_CONNECTION_PORT=5432
+POSTGRES_CONNECTION_PASSWORD=change-me
+MARIADB_LOGIN_PASSWORD=change-me
+MARIADB_ADMIN_PASSWORD=change-me
 ```
 
-El sitio se habilita mediante un enlace simbólico:
-
-```text
-/etc/apache2/sites-enabled/visualizador.conf
-    → /etc/apache2/sites-available/visualizador.conf
-```
-
-Por último, se asegura que Apache esté iniciado y habilitado para arrancar con
-el sistema.
-
-#### Funcionamiento del VirtualHost
-
-El VirtualHost actual escucha solamente por HTTP en el puerto `80`. Cuando una
-solicitud llega con `Host: 192.168.62.47`, Apache la reenvía a:
-
-```text
-http://127.0.0.1:8088/
-```
-
-La respuesta del visualizador vuelve al cliente a través de Apache. El puerto
-`8088` no necesita quedar expuesto a la red externa.
-
-La configuración:
-
-- Deshabilita el uso de Apache como proxy abierto.
-- Conserva el encabezado `Host` original.
-- Informa al backend que el protocolo externo es HTTP y el puerto es 80.
-- Escribe logs en `visualizador_access.log` y `visualizador_error.log` dentro
-  del directorio de logs de Apache.
-
-Si cambia la plantilla, Ansible conserva un backup del archivo anterior antes
-de reemplazarlo.
-
-### 6. Reglas de UFW
-
-El playbook agrega las siguientes autorizaciones:
-
-| Puerto | Origen | Finalidad |
-| --- | --- | --- |
-| `22/tcp` | Cualquier origen | Administración SSH. |
-| `80/tcp` | Cualquier origen | Acceso HTTP al visualizador. |
-| `443/tcp` | Cualquier origen | Reservado para acceso HTTPS. |
-| `5432/tcp` | `DOCKER_NETWORK_SUBNET` | PostgreSQL desde la red Docker. |
-
-No abre el puerto `8088`, porque Apache accede al visualizador mediante
-`127.0.0.1`.
-
-Las tareas que establecen políticas predeterminadas y habilitan UFW están
-comentadas. En consecuencia, el playbook agrega reglas, pero no activa el
-firewall si estaba deshabilitado.
-
-### 7. Configuración de `pg_hba.conf`
-
-El playbook agrega o mantiene una regla equivalente a:
-
-```text
-host    all    all    <DOCKER_NETWORK_SUBNET>    scram-sha-256
-```
-
-Esto significa:
-
-- `host`: la regla aplica a conexiones TCP/IP.
-- Primer `all`: permite intentar la conexión a cualquier base existente.
-- Segundo `all`: permite intentar la conexión con cualquier usuario existente.
-- `<DOCKER_NETWORK_SUBNET>`: limita el origen a la subred definida en `.env`.
-- `scram-sha-256`: exige autenticación con contraseña SCRAM.
-
-La regla no crea bases, usuarios ni contraseñas. Solamente determina desde qué
-red se permite intentar la autenticación.
-
-La modificación genera un backup de `pg_hba.conf` y solicita una recarga de
-PostgreSQL.
-
-Las tareas para configurar `listen_addresses = '*'` y el puerto dentro de
-`postgresql.conf` están comentadas. Por eso, para que los contenedores puedan
-conectarse, PostgreSQL ya debe estar escuchando en una interfaz accesible desde
-la red Docker. Modificar únicamente `pg_hba.conf` no alcanza si PostgreSQL está
-escuchando solo en `localhost`.
-
-### 8. Aplicación de handlers
-
-Antes de las verificaciones finales, el playbook fuerza la ejecución de los
-handlers pendientes:
-
-- Para Apache, primero ejecuta `apache2ctl configtest`. Solo si la sintaxis es
-  válida recarga el servicio.
-- Para cambios en `pg_hba.conf`, recarga PostgreSQL.
-
-Existe también un handler para reiniciar PostgreSQL, pero las tareas que lo
-utilizarían están comentadas actualmente.
-
-### 9. Verificaciones finales
-
-Después de aplicar los cambios se comprueba:
-
-- Que la configuración de Apache pase `apache2ctl configtest`.
-- Que Apache responda localmente en `http://127.0.0.1/`.
-- El valor efectivo de `listen_addresses` en PostgreSQL.
-- El puerto efectivo de PostgreSQL.
-- Se crea la cuenta `'admin'@'%'` con privilegios globales si no existe.
-- Que esa cuenta tenga `ALL PRIVILEGES ON *.*`, es decir, acceso total global.
-- El estado final de UFW.
-
-Al terminar, Ansible muestra un resumen con las rutas de backup y los valores
-obtenidos.
-
-La prueba HTTP actual confirma que Apache responde, pero no garantiza por sí
-sola que la respuesta provenga del VirtualHost del visualizador, porque consulta
-`127.0.0.1` y no envía el `Host` configurado para el sitio.
-
-## Estado actual de HTTPS
-
-HTTPS todavía no está configurado. El puerto `443` está autorizado en UFW, pero
-el proyecto no realiza aún estas acciones:
-
-- Habilitar el módulo `ssl` de Apache.
-- Instalar un certificado y su clave privada.
-- Crear un VirtualHost en el puerto `443`.
-- Redirigir las solicitudes HTTP hacia HTTPS.
-
-Como el sitio usa actualmente una IP privada, un certificado debería ser
-emitido para esa IP por una CA interna, ser autofirmado para pruebas, o se
-debería asignar un nombre DNS interno con su certificado correspondiente.
-
-## Lo que el playbook no hace
-
-- No despliega ni inicia el contenedor del visualizador.
-- No actualiza la caché de APT ni instala paquetes del sistema.
-- No instala PostgreSQL Server.
-- No crea bases de datos, usuarios ni contraseñas de PostgreSQL.
-- No reemplaza la contraseña de una cuenta MariaDB ya existente.
-- No corrige los privilegios de una cuenta MariaDB existente: si no son
-  globales, la validación final detiene la ejecución.
-- No configura actualmente `listen_addresses` ni cambia el puerto de PostgreSQL.
-- No habilita UFW si el servicio está deshabilitado.
-- No configura HTTPS ni certificados.
-- No deshabilita el sitio predeterminado `000-default` de Apache.
-- No ejecuta cambios sobre el grupo `production`.
+No versiones `.env` ni el inventario real.
 
 ## Ejecución
 
-### Construir e iniciar el controlador
-
-Desde PowerShell, en la carpeta del proyecto:
+### Construir el controlador
 
 ```powershell
 docker compose up -d --build
 ```
-
-El proyecto se monta dentro del contenedor en `/ansible`. Las claves de
-`$env:USERPROFILE\.ssh` se montan en modo lectura y luego se copian dentro del
-contenedor con permisos compatibles con SSH.
 
 ### Verificar conectividad
 
@@ -310,7 +145,7 @@ contenedor con permisos compatibles con SSH.
 docker compose exec ansible ansible staging -m ping
 ```
 
-### Validar la sintaxis sin aplicar cambios
+### Validar sintaxis
 
 ```powershell
 docker compose exec ansible ansible-playbook --syntax-check playbook.yaml
@@ -318,51 +153,45 @@ docker compose exec ansible ansible-playbook --syntax-check playbook.yaml
 
 ### Ejecutar el playbook
 
-Completá en `.env` las contraseñas de PostgreSQL y MariaDB:
-
-```dotenv
-DOCKER_NETWORK_SUBNET=172.23.0.0/16
-DOCKER_NETWORK_GATEWAY=172.23.0.1
-POSTGRES_CONNECTION_PASSWORD=clave-del-usuario-postgres
-MARIADB_LOGIN_PASSWORD=clave-del-usuario-root
-MARIADB_ADMIN_PASSWORD=clave-para-el-nuevo-admin
-```
-
-Docker Compose lee `.env` automáticamente. Creá o recreá el controlador después
-de modificarlo y ejecutá el playbook:
-
 ```powershell
-docker compose up -d --build --force-recreate
 docker compose exec ansible ansible-playbook playbook.yaml
 ```
 
-El host, puerto y usuario pueden reemplazarse para una ejecución con variables
-extra, por ejemplo:
+## Idempotencia
 
-```powershell
-docker compose exec ansible ansible-playbook playbook.yaml `
-  -e mariadb_connection_host=192.168.62.50 `
-  -e mariadb_connection_port=3306 `
-  -e mariadb_connection_user=root
-```
+Las tareas de módulos, plantillas, enlaces, servicios, reglas de UFW y `pg_hba.conf` están declaradas para no repetir cambios cuando el servidor ya se encuentra en el estado esperado.
+
+Los backups constituyen la excepción: cada ejecución crea uno nuevo para conservar un punto de recuperación previo.
 
 ## Consideraciones de seguridad
 
-- `host_key_checking` está deshabilitado, por lo que Ansible no valida la
-  identidad SSH del servidor contra `known_hosts`.
-- El acceso a `staging` se realiza como `root`.
-- Las contraseñas de MariaDB se leen desde `.env`, que está excluido por
-  `.gitignore`, y las tareas que las utilizan tienen `no_log`.
-- La regla de PostgreSQL permite todas las bases y usuarios desde la red Docker,
-  pero sigue exigiendo credenciales SCRAM válidas.
-- Los backups pueden contener configuración sensible y se crean con permisos
-  restrictivos en el servidor. La copia local también debe protegerse.
-- Antes de habilitar UFW conviene verificar que la regla y el puerto SSH sean
-  correctos para evitar perder el acceso remoto.
+- Las credenciales se leen desde `.env`, excluido mediante `.gitignore`.
+- Las tareas que manipulan contraseñas utilizan `no_log`.
+- Los backups pueden contener información sensible y deben protegerse.
+- El inventario real no se versiona.
+- `host_key_checking` está deshabilitado para simplificar el laboratorio; en producción debería habilitarse y utilizar `known_hosts`.
+- El acceso remoto no debería realizarse como `root` en un entorno nuevo. Es preferible un usuario dedicado con `sudo` controlado.
+- Antes de habilitar UFW se debe confirmar que la regla SSH sea correcta para evitar perder acceso remoto.
 
-## Idempotencia
+## Alcance y limitaciones
 
-Las tareas de paquetes, módulos, plantillas, enlaces, servicios, reglas de UFW y
-`pg_hba.conf` están declaradas para no repetir cambios cuando el estado ya es el
-esperado. Los backups son la excepción intencional: cada ejecución crea uno
-nuevo usando la fecha y hora obtenidas al inicio.
+El proyecto no:
+
+- Despliega la aplicación.
+- Instala PostgreSQL o MariaDB Server.
+- Crea bases de datos PostgreSQL.
+- Configura certificados HTTPS.
+- Activa UFW si estaba deshabilitado.
+- Gestiona alta disponibilidad.
+- Sustituye una solución completa de gestión de secretos.
+
+## Tecnologías
+
+- Ansible
+- Docker y Docker Compose
+- Linux
+- Apache HTTP Server
+- UFW
+- PostgreSQL
+- MariaDB
+- Bash y SSH
