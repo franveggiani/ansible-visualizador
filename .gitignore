@@ -1,5 +1,11 @@
 # Credenciales locales
 .env
 
+# Inventario real de infraestructura
+inventory.ini
+
 # Backups generados por el playbook
 backups/
+
+# Archivos temporales
+*.retry
